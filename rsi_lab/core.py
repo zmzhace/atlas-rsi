@@ -3,8 +3,11 @@ from __future__ import annotations
 from dataclasses import asdict, dataclass, field
 from hashlib import sha256
 import json
+from math import isfinite
 from pathlib import Path
 from typing import Any, Mapping, Protocol, Sequence
+
+from .stats import conservative_delta
 
 
 @dataclass(frozen=True)
@@ -22,8 +25,23 @@ class Constitution:
     minimum_holdout_delta: float = 0.01
     minimum_safety_score: float = 1.0
     maximum_cost_ratio: float = 1.25
+    confidence_level: float = 0.95
+    minimum_trials_for_ci: int = 10
     allow_weight_updates: bool = False
     allow_evaluator_updates: bool = False
+    high_risk_requires_approval: bool = True
+
+    def __post_init__(self) -> None:
+        if not self.objective.strip():
+            raise ValueError("objective must not be empty")
+        if self.max_candidates_per_round < 1 or self.max_rounds < 1:
+            raise ValueError("candidate and round budgets must be positive")
+        if not 0.0 < self.confidence_level < 1.0:
+            raise ValueError("confidence_level must be between zero and one")
+        if self.minimum_trials_for_ci < 2:
+            raise ValueError("minimum_trials_for_ci must be at least two")
+        if self.maximum_cost_ratio <= 0.0:
+            raise ValueError("maximum_cost_ratio must be positive")
 
     def fingerprint(self) -> str:
         encoded = json.dumps(asdict(self), sort_keys=True).encode("utf-8")
@@ -57,6 +75,8 @@ class ScoreCard:
     anchors_passed: bool
     metrics: Mapping[str, float] = field(default_factory=dict)
     notes: tuple[str, ...] = ()
+    dev_samples: tuple[float, ...] = ()
+    holdout_samples: tuple[float, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -128,12 +148,15 @@ class EvaluatorRegistry:
         at_epoch_boundary: bool,
         minimum_anchor_score: float,
         constitution: Constitution,
+        operator_approved: bool = False,
     ) -> bool:
         if not constitution.allow_evaluator_updates:
             return False
         if not at_epoch_boundary:
             return False
         if proposal.anchor_score < minimum_anchor_score:
+            return False
+        if constitution.high_risk_requires_approval and not operator_approved:
             return False
         self.active_version = proposal.version
         self.history.append(proposal.version)
@@ -161,10 +184,18 @@ class EvolutionEngine:
         self.knowledge: list[KnowledgeEntry] = []
         self.incumbent_id = baseline.candidate_id
         self.promotion_history = [baseline.candidate_id]
+        self.completed_rounds = 0
+        self.round_reports: list[RoundReport] = []
 
         baseline_score = self.domain.evaluate(
             baseline, self.evaluators.active_version
         )
+        self._validate_scorecard(baseline_score)
+        if (
+            not baseline_score.anchors_passed
+            or baseline_score.safety_score < constitution.minimum_safety_score
+        ):
+            raise ValueError("baseline must pass all safety gates")
         self.scores[baseline.candidate_id] = baseline_score
         self.audit.append(
             "baseline_registered",
@@ -182,6 +213,8 @@ class EvolutionEngine:
     def run_round(self, round_index: int) -> RoundReport:
         if round_index < 1 or round_index > self.constitution.max_rounds:
             raise ValueError("round index is outside the constitutional budget")
+        if round_index != self.completed_rounds + 1:
+            raise ValueError("rounds must run exactly once and in order")
 
         incumbent_before = self.incumbent
         incumbent_score = self.scores[incumbent_before.candidate_id]
@@ -208,6 +241,7 @@ class EvolutionEngine:
                 continue
 
             score = self.domain.evaluate(candidate, self.evaluators.active_version)
+            self._validate_scorecard(score)
             self.archive[candidate.candidate_id] = candidate
             self.scores[candidate.candidate_id] = score
             round_scores[candidate.candidate_id] = score
@@ -256,6 +290,8 @@ class EvolutionEngine:
             scores=round_scores,
             constitution_fingerprint=self.constitution.fingerprint(),
         )
+        self.completed_rounds = round_index
+        self.round_reports.append(report)
         self.audit.append("round_completed", self._report_dict(report))
         return report
 
@@ -270,6 +306,99 @@ class EvolutionEngine:
         )
         return self.incumbent_id
 
+    def snapshot(self) -> dict[str, Any]:
+        return {
+            "version": 2,
+            "constitution": asdict(self.constitution),
+            "archive": {
+                key: asdict(value) for key, value in self.archive.items()
+            },
+            "scores": {key: asdict(value) for key, value in self.scores.items()},
+            "knowledge": [asdict(entry) for entry in self.knowledge],
+            "incumbent_id": self.incumbent_id,
+            "promotion_history": list(self.promotion_history),
+            "completed_rounds": self.completed_rounds,
+            "round_reports": [
+                self._report_dict(report) for report in self.round_reports
+            ],
+            "evaluator_history": list(self.evaluators.history),
+            "active_evaluator": self.evaluators.active_version,
+        }
+
+    @classmethod
+    def restore(
+        cls,
+        snapshot: Mapping[str, Any],
+        domain: Domain,
+        *,
+        audit_log: AuditLog | None = None,
+    ) -> "EvolutionEngine":
+        if snapshot.get("version") not in {1, 2}:
+            raise ValueError("unsupported snapshot version")
+        engine = cls.__new__(cls)
+        constitution_payload = dict(snapshot["constitution"])
+        constitution_payload["allowed_surfaces"] = tuple(
+            constitution_payload["allowed_surfaces"]
+        )
+        engine.constitution = Constitution(**constitution_payload)
+        engine.domain = domain
+        engine.evaluators = EvaluatorRegistry(snapshot["evaluator_history"][0])
+        engine.evaluators.history = list(snapshot["evaluator_history"])
+        engine.evaluators.active_version = snapshot["active_evaluator"]
+        engine.audit = audit_log or AuditLog()
+        engine.archive = {
+            key: Candidate(**value) for key, value in snapshot["archive"].items()
+        }
+        engine.scores = {
+            key: cls._restore_score(value)
+            for key, value in snapshot["scores"].items()
+        }
+        engine.knowledge = [
+            KnowledgeEntry(**value) for value in snapshot["knowledge"]
+        ]
+        engine.incumbent_id = snapshot["incumbent_id"]
+        engine.promotion_history = list(snapshot["promotion_history"])
+        legacy_rounds = max(
+            (entry.round_index for entry in engine.knowledge), default=0
+        )
+        engine.completed_rounds = int(
+            snapshot.get(
+                "completed_rounds",
+                max(len(snapshot.get("round_reports", [])), legacy_rounds),
+            )
+        )
+        engine.round_reports = [
+            RoundReport(
+                round_index=int(value["round_index"]),
+                incumbent_before=value["incumbent_before"],
+                incumbent_after=value["incumbent_after"],
+                promoted=value.get("promoted"),
+                rejected={
+                    key: tuple(reasons)
+                    for key, reasons in value["rejected"].items()
+                },
+                scores={
+                    key: cls._restore_score(score)
+                    for key, score in value["scores"].items()
+                },
+                constitution_fingerprint=value["constitution_fingerprint"],
+            )
+            for value in snapshot.get("round_reports", [])
+        ]
+        engine.audit.append(
+            "snapshot_restored",
+            {"incumbent_id": engine.incumbent_id},
+        )
+        return engine
+
+    @staticmethod
+    def _restore_score(value: Mapping[str, Any]) -> ScoreCard:
+        payload = dict(value)
+        payload["notes"] = tuple(payload.get("notes", ()))
+        payload["dev_samples"] = tuple(payload.get("dev_samples", ()))
+        payload["holdout_samples"] = tuple(payload.get("holdout_samples", ()))
+        return ScoreCard(**payload)
+
     def _validate_candidate(self, candidate: Candidate, round_index: int) -> list[str]:
         reasons: list[str] = []
         if candidate.round_index != round_index:
@@ -282,6 +411,17 @@ class EvolutionEngine:
             reasons.append("duplicate_candidate_id")
         return reasons
 
+    @staticmethod
+    def _validate_scorecard(score: ScoreCard) -> None:
+        bounded = (score.dev_score, score.holdout_score, score.safety_score)
+        if any(not isfinite(value) or not 0.0 <= value <= 1.0 for value in bounded):
+            raise ValueError("scores must be finite values between zero and one")
+        if not isfinite(score.cost) or score.cost <= 0.0:
+            raise ValueError("evaluation cost must be finite and positive")
+        samples = (*score.dev_samples, *score.holdout_samples)
+        if any(not isfinite(value) or not 0.0 <= value <= 1.0 for value in samples):
+            raise ValueError("score samples must be finite values between zero and one")
+
     def _promotion_failures(
         self, score: ScoreCard, incumbent: ScoreCard
     ) -> list[str]:
@@ -290,10 +430,19 @@ class EvolutionEngine:
             reasons.append("anchor_failure")
         if score.safety_score < self.constitution.minimum_safety_score:
             reasons.append("safety_regression")
-        if (
-            score.holdout_score - incumbent.holdout_score
-            < self.constitution.minimum_holdout_delta
-        ):
+        delta = score.holdout_score - incumbent.holdout_score
+        enough_samples = (
+            len(score.holdout_samples) >= self.constitution.minimum_trials_for_ci
+            and len(incumbent.holdout_samples)
+            >= self.constitution.minimum_trials_for_ci
+        )
+        if enough_samples:
+            delta = conservative_delta(
+                score.holdout_samples,
+                incumbent.holdout_samples,
+                self.constitution.confidence_level,
+            )
+        if delta < self.constitution.minimum_holdout_delta:
             reasons.append("insufficient_holdout_gain")
         baseline_cost = max(incumbent.cost, 1e-12)
         if score.cost / baseline_cost > self.constitution.maximum_cost_ratio:

@@ -24,5 +24,7 @@ jobs:
         run: python -m compileall -q rsi_lab demo.py tests
       - name: Test
         run: python -m unittest discover -s tests -v
+      - name: Check CLI
+        run: atlas-rsi --help
       - name: Run demo
         run: atlas-rsi-demo

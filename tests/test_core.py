@@ -103,6 +103,14 @@ class EvolutionEngineTests(unittest.TestCase):
         self.assertIn("anchor_failure", report.rejected["unsafe"])
         self.assertIn("mutation_surface_not_permitted", report.rejected["weights"])
 
+    def test_rejects_an_unsafe_baseline(self) -> None:
+        unsafe = Candidate(
+            "unsafe-base", None, 0, "harness",
+            {"holdout": 0.5, "safety": 0.0, "anchors": False}, "unsafe",
+        )
+        with self.assertRaisesRegex(ValueError, "baseline"):
+            EvolutionEngine(Constitution(objective="test"), FixedDomain([]), unsafe)
+
     def test_rollback_restores_previous_incumbent(self) -> None:
         candidate = Candidate(
             "good",
@@ -138,6 +146,15 @@ class EvolutionEngineTests(unittest.TestCase):
                 at_epoch_boundary=False,
                 minimum_anchor_score=0.95,
                 constitution=enabled,
+                operator_approved=True,
+            )
+        )
+        self.assertFalse(
+            registry.try_promote(
+                proposal,
+                at_epoch_boundary=True,
+                minimum_anchor_score=0.95,
+                constitution=enabled,
             )
         )
         self.assertTrue(
@@ -146,6 +163,7 @@ class EvolutionEngineTests(unittest.TestCase):
                 at_epoch_boundary=True,
                 minimum_anchor_score=0.95,
                 constitution=enabled,
+                operator_approved=True,
             )
         )
 
