@@ -1,0 +1,29 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "atlas-rsi"
+version = "0.1.0"
+description = "A bounded and auditable control plane for recursive self-improvement experiments"
+readme = "README.md"
+requires-python = ">=3.10"
+license = {text = "MIT"}
+authors = [{name = "zmzhace"}]
+classifiers = [
+  "Development Status :: 3 - Alpha",
+  "License :: OSI Approved :: MIT License",
+  "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3.10",
+  "Programming Language :: Python :: 3.11",
+  "Programming Language :: Python :: 3.12",
+]
+
+[project.scripts]
+atlas-rsi-demo = "demo:main"
+
+[tool.setuptools]
+py-modules = ["demo"]
+
+[tool.setuptools.packages.find]
+include = ["rsi_lab*"]
